@@ -32,11 +32,11 @@ import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from utils.path_resolver import get_config_dir
+from utils.path_resolver import get_claude_home, get_config_dir, get_policies_dir
 
 # mcp 2.0 renamed FastMCP to MCPServer and moved it to mcp.server.mcpserver.
 # Both names are probed so this server runs under either major version; the
@@ -45,6 +45,8 @@ try:
     from mcp.server.mcpserver import MCPServer
 except ImportError:  # mcp < 2.0
     from mcp.server.fastmcp import FastMCP as MCPServer
+from mcp.types import ToolAnnotations
+from pydantic import Field
 from base.response import to_json
 from base.decorators import mcp_tool_handler
 from base.persistence import SessionIdResolver
@@ -56,9 +58,23 @@ mcp = MCPServer(
 
 # Paths
 MEMORY_PATH = get_config_dir()
-FLAG_DIR = Path.home() / ".claude"
+FLAG_DIR = get_claude_home()
 CURRENT_SESSION_FILE = MEMORY_PATH / ".current-session.json"
 LOGS_PATH = MEMORY_PATH / "logs" / "sessions"
+
+# Failure knowledge base, resolved through path_resolver so CLAUDE_POLICIES_DIR
+# is honored; defaults to ~/.claude/policies.
+FAILURE_KB_FILE = (
+    get_policies_dir() / "03-execution-system" / "failure-prevention" / "failure-kb.json"
+)
+
+# Read-only annotation reused by every tool that only inspects state on disk.
+_READ_ONLY = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
 
 # Singleton session resolver
 _session_resolver = SessionIdResolver(MEMORY_PATH)
@@ -84,47 +100,87 @@ def _get_session_id() -> str:
     return _session_resolver.get()
 
 
+def _flag_paths(flag_name: str, session_id: str) -> list:
+    """Return every filesystem location a flag may live at, newest scheme first.
+
+    Args:
+        flag_name: Flag identifier, e.g. 'task-breakdown-pending'.
+        session_id: Session the flag belongs to.
+
+    Returns:
+        List of candidate Paths: the session-folder location followed by the
+        legacy ~/.claude/ location.
+    """
+    return [
+        LOGS_PATH / session_id / "flags" / f"{flag_name}.json",
+        FLAG_DIR / f".{flag_name}-{session_id}.json",
+    ]
+
+
+def _unlink_flag(flag_name: str, session_id: str) -> None:
+    """Delete a flag from every location it may occupy.
+
+    Both the session-folder and the legacy location are removed, so an expired
+    flag cannot be resurrected from whichever copy was left behind.
+    """
+    for path in _flag_paths(flag_name, session_id):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _find_flag(flag_name: str, session_id: str) -> Optional[dict]:
-    """Find session-specific flag file, auto-expire stale flags."""
+    """Find a session-specific flag file, auto-expiring stale flags.
+
+    A flag older than CHECKPOINT_MAX_AGE_MINUTES is deleted from every location
+    and treated as absent. Unreadable or malformed flag files are skipped rather
+    than treated as active, so a corrupt flag cannot permanently block a tool.
+
+    Args:
+        flag_name: Flag identifier, e.g. 'checkpoint-pending'.
+        session_id: Session the flag belongs to.
+
+    Returns:
+        The parsed flag dict when a live flag exists, otherwise None.
+    """
     if not session_id:
         return None
 
-    # New location: session folder
-    flag_file = LOGS_PATH / session_id / "flags" / f"{flag_name}.json"
-    if flag_file.exists():
+    for flag_file in _flag_paths(flag_name, session_id):
         try:
             data = json.loads(flag_file.read_text(encoding="utf-8"))
-            # Auto-expire
-            created = data.get("created_at", "")
-            if created:
-                age = datetime.now() - datetime.fromisoformat(created)
-                if age > timedelta(minutes=CHECKPOINT_MAX_AGE_MINUTES):
-                    flag_file.unlink(missing_ok=True)
-                    return None
-            return data
-        except Exception:
-            pass
+        except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
 
-    # Legacy: ~/.claude/ location
-    legacy = FLAG_DIR / f".{flag_name}-{session_id}.json"
-    if legacy.exists():
-        try:
-            data = json.loads(legacy.read_text(encoding="utf-8"))
-            created = data.get("created_at", "")
-            if created:
+        created = data.get("created_at", "")
+        if created:
+            try:
                 age = datetime.now() - datetime.fromisoformat(created)
-                if age > timedelta(minutes=CHECKPOINT_MAX_AGE_MINUTES):
-                    legacy.unlink(missing_ok=True)
-                    return None
-            return data
-        except Exception:
-            pass
+            except (TypeError, ValueError):
+                return data
+            if age > timedelta(minutes=CHECKPOINT_MAX_AGE_MINUTES):
+                _unlink_flag(flag_name, session_id)
+                return None
+        return data
 
     return None
 
 
 def _check_flag_with_ttl(flag_name: str, session_id: str, ttl_seconds: int = 90):
-    """Check flag with TTL expiry. Returns (is_active, flag_data)."""
+    """Check a flag against a short TTL, clearing it when expired.
+
+    Args:
+        flag_name: Flag identifier.
+        session_id: Session the flag belongs to.
+        ttl_seconds: Age past which the flag is considered expired.
+
+    Returns:
+        Tuple of (is_active, flag_data). Data is None when the flag is absent
+        or expired.
+    """
     data = _find_flag(flag_name, session_id)
     if not data:
         return False, None
@@ -133,13 +189,11 @@ def _check_flag_with_ttl(flag_name: str, session_id: str, ttl_seconds: int = 90)
     if created:
         try:
             age = (datetime.now() - datetime.fromisoformat(created)).total_seconds()
-            if age > ttl_seconds:
-                # Expired - try to clean up
-                flag_file = LOGS_PATH / session_id / "flags" / f"{flag_name}.json"
-                flag_file.unlink(missing_ok=True)
-                return False, None
-        except Exception:
-            pass
+        except (TypeError, ValueError):
+            return True, data
+        if age > ttl_seconds:
+            _unlink_flag(flag_name, session_id)
+            return False, None
 
     return True, data
 
@@ -176,9 +230,18 @@ def _pipeline_step_present(trace: dict, step_name: str) -> bool:
 # TOOL 1: FULL VALIDATION PIPELINE
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False,
+    idempotentHint=True, openWorldHint=False))
 @mcp_tool_handler
-def validate_tool_call(tool_name: str, tool_input: str = "{}") -> str:
+def validate_tool_call(
+    tool_name: Annotated[str, Field(
+        description="Tool about to be called, e.g. 'Write', 'Edit', 'Bash', "
+                    "'Read', 'Grep'.")],
+    tool_input: Annotated[str, Field(
+        description="JSON object string of the proposed tool parameters. "
+                    "Invalid JSON is treated as an empty parameter set.")] = "{}",
+) -> str:
     """Run all policy checks for a tool call. Returns allow/block decision.
 
     Checks in order:
@@ -295,7 +358,9 @@ def validate_tool_call(tool_name: str, tool_input: str = "{}") -> str:
 # TOOL 2: TASK BREAKDOWN CHECK
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False,
+    idempotentHint=True, openWorldHint=False))
 @mcp_tool_handler
 def check_task_breakdown() -> str:
     """Check if task breakdown is pending for current session."""
@@ -317,7 +382,9 @@ def check_task_breakdown() -> str:
 # TOOL 3: SKILL SELECTION CHECK
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False,
+    idempotentHint=True, openWorldHint=False))
 @mcp_tool_handler
 def check_skill_selected() -> str:
     """Check if skill/agent selection is pending for current session."""
@@ -339,9 +406,13 @@ def check_skill_selected() -> str:
 # TOOL 4: LEVEL COMPLETION CHECK
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
-def check_level_completion(level: str = "all") -> str:
+def check_level_completion(
+    level: Annotated[str, Field(
+        description="Which pipeline levels to report on: 'level1', 'level2', "
+                    "or 'all'.")] = "all",
+) -> str:
     """Check if pipeline levels are complete in flow-trace.
 
     Args:
@@ -382,7 +453,9 @@ def check_level_completion(level: str = "all") -> str:
 # TOOL 5: ENFORCER STATE
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False,
+    idempotentHint=True, openWorldHint=False))
 @mcp_tool_handler
 def get_enforcer_state() -> str:
     """Get current enforcer state snapshot (all flags + flow-trace status)."""
@@ -422,9 +495,81 @@ def get_enforcer_state() -> str:
 # TOOL 6: FAILURE KB PATTERNS
 # =============================================================================
 
-@mcp.tool()
+def _load_failure_kb() -> tuple:
+    """Load the failure knowledge base keyed by tool name.
+
+    Returns:
+        Tuple of (kb_dict, error_message). The dict is empty and the message is
+        populated when the file is absent or malformed, so the caller can report
+        that the knowledge base was unavailable instead of silently emitting
+        fewer hints.
+    """
+    try:
+        data = json.loads(FAILURE_KB_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}, f"Failure KB not found: {FAILURE_KB_FILE}"
+    except (json.JSONDecodeError, OSError) as e:
+        return {}, f"Failure KB unreadable: {str(e)[:150]}"
+    if not isinstance(data, dict):
+        return {}, "Failure KB root is not an object keyed by tool name"
+    return data, ""
+
+
+def _hints_from_kb(patterns: list, tool_name: str, params: dict) -> list:
+    """Derive hints for a tool call from its knowledge-base patterns.
+
+    Translation patterns are matched against the first token of a Bash command;
+    every other pattern contributes its description as an advisory hint. Hints
+    are always advisory - this function never blocks a call.
+
+    Args:
+        patterns: Knowledge-base entries recorded for this tool.
+        tool_name: Tool being called.
+        params: Parsed tool parameters.
+
+    Returns:
+        List of hint strings.
+    """
+    hints = []
+    command = str(params.get("command", "")).strip().lower()
+    first_token = command.split(maxsplit=1)[0] if command else ""
+
+    for pattern in patterns:
+        if not isinstance(pattern, dict):
+            continue
+        solution = pattern.get("solution") or {}
+        if not isinstance(solution, dict):
+            continue
+
+        if solution.get("type") == "translate" and tool_name == "Bash":
+            mapping = solution.get("mapping") or {}
+            replacement = mapping.get(first_token) if isinstance(mapping, dict) else None
+            if replacement:
+                hints.append(
+                    f"Translate Windows '{first_token}' -> Unix '{replacement}' "
+                    f"(failure pattern {pattern.get('pattern_id', 'unknown')})"
+                )
+            continue
+
+        description = pattern.get("description") or solution.get("description")
+        if description:
+            hints.append(
+                f"{description} (failure pattern "
+                f"{pattern.get('pattern_id', 'unknown')})"
+            )
+    return hints
+
+
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
-def check_failure_patterns(tool_name: str, tool_input: str = "{}") -> str:
+def check_failure_patterns(
+    tool_name: Annotated[str, Field(
+        description="Tool to look up in the failure knowledge base, e.g. "
+                    "'Edit', 'Read', 'Bash', 'Grep'.")],
+    tool_input: Annotated[str, Field(
+        description="JSON object string of the proposed tool parameters, "
+                    "matched against known failure patterns.")] = "{}",
+) -> str:
     """Check known failure patterns from failure-kb.json for a tool call.
 
     Returns non-blocking hints about known failure patterns.
@@ -439,36 +584,18 @@ def check_failure_patterns(tool_name: str, tool_input: str = "{}") -> str:
         params = {}
 
     hints = []
+    kb, kb_error = _load_failure_kb()
+    tool_patterns = kb.get(tool_name, []) if isinstance(kb, dict) else []
 
-    # Load failure KB
-    project_root = Path(__file__).resolve().parent.parent.parent
-    kb_path = project_root / "scripts" / "architecture" / "03-execution-system" / "failure-prevention" / "failure-kb.json"
+    hints.extend(_hints_from_kb(tool_patterns, tool_name, params))
 
-    kb = {}
-    if kb_path.exists():
-        try:
-            kb = json.loads(kb_path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-
-    # Check patterns
+    # Built-in checks that the knowledge base does not encode.
     if tool_name == "Edit":
         old_str = params.get("old_string", "")
         if old_str and re.match(r"^\s*\d+", old_str):
             hints.append("Edit old_string may contain line number prefix - strip before Edit")
         if not params.get("file_path"):
             hints.append("Edit requires file_path parameter")
-
-    elif tool_name == "Bash" and sys.platform == "win32":
-        cmd = params.get("command", "").strip().lower()
-        # Check Windows -> Unix translations
-        translations = {
-            "del ": "rm", "copy ": "cp", "move ": "mv", "type ": "cat",
-            "dir ": "ls", "cls": "clear", "ren ": "mv", "md ": "mkdir -p",
-        }
-        for win_cmd, unix_cmd in translations.items():
-            if cmd.startswith(win_cmd):
-                hints.append(f"Translate Windows '{win_cmd.strip()}' -> Unix '{unix_cmd}'")
 
     elif tool_name == "Grep":
         if not params.get("head_limit"):
@@ -479,13 +606,18 @@ def check_failure_patterns(tool_name: str, tool_input: str = "{}") -> str:
         if fp and not params.get("offset") and not params.get("limit"):
             hints.append("Consider adding offset/limit for large files")
 
-    return to_json({
+    response = {
         "success": True,
         "tool": tool_name,
-        "hints": hints,
+        "hints": sorted(set(hints)),
         "kb_loaded": bool(kb),
-        "patterns_checked": len(hints)
-    })
+        "kb_path": str(FAILURE_KB_FILE),
+        "kb_patterns_for_tool": len(tool_patterns),
+        "patterns_checked": len(hints),
+    }
+    if kb_error:
+        response["kb_warning"] = kb_error
+    return to_json(response)
 
 
 # =============================================================================
@@ -516,25 +648,33 @@ _EXT_SKILL_MAP = {
 }
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
-def get_dynamic_skill_hint(file_path: str) -> str:
+def get_dynamic_skill_hint(
+    file_path: Annotated[str, Field(
+        description="Path of the file being worked on. The extension and "
+                    "parent directories determine the suggested skill.")],
+) -> str:
     """Get skill/agent hint based on file extension.
 
     Args:
         file_path: File path being accessed
     """
     try:
-        ext = Path(file_path).suffix.lower()
+        path = Path(file_path)
+        ext = path.suffix.lower()
         skill = _EXT_SKILL_MAP.get(ext)
 
-        # Special cases
-        name = Path(file_path).name.lower()
+        # Special cases. The workflow check inspects the parent directories,
+        # not the filename: a filename can never contain a path separator, so
+        # matching '.github/workflows' against the name alone never fires.
+        name = path.name.lower()
+        parents = [p.lower() for p in path.parts[:-1]]
         if name == "dockerfile" or name.endswith(".dockerfile"):
             skill = "docker"
         elif name == "jenkinsfile":
             skill = "jenkins-pipeline"
-        elif name.endswith(".github/workflows"):
+        elif ".github" in parents and "workflows" in parents:
             skill = "github-actions-ci"
 
         return to_json({
@@ -552,9 +692,16 @@ def get_dynamic_skill_hint(file_path: str) -> str:
 # TOOL 8: RESET FLAGS
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True,
+    idempotentHint=True, openWorldHint=False))
 @mcp_tool_handler
-def reset_enforcer_flags(flag_name: str = "all") -> str:
+def reset_enforcer_flags(
+    flag_name: Annotated[str, Field(
+        description="Flag to clear: 'task-breakdown-pending', "
+                    "'skill-selection-pending', 'checkpoint-pending', or 'all' "
+                    "to clear every flag for the current session.")] = "all",
+) -> str:
     """Reset enforcement flags for current session.
 
     Args:
