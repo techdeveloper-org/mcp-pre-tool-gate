@@ -17,17 +17,23 @@ Also provides:
 - Dynamic skill context hints (file extension -> skill suggestion)
 - Failure KB pattern matching (known failure prevention)
 - Tool-specific optimization hints (Grep head_limit, Read offset/limit)
+- Explicitly-invoked agent-persona dispatch validation (see TOOL 9) - this
+  server has no live PreToolUse hook registration (claude-workflow-engine
+  ADR-006, Hook-Free Execution Model), so every tool here, including TOOL 9,
+  is called on-demand by the orchestrating session, never triggered
+  automatically.
 
 Backend: Direct file I/O (flag files, flow-trace.json, failure-kb.json)
 Transport: stdio
 
-Tools (8):
+Tools (9):
   validate_tool_call, check_task_breakdown, check_skill_selected,
   check_level_completion, get_enforcer_state, check_failure_patterns,
-  get_dynamic_skill_hint, reset_enforcer_flags
+  get_dynamic_skill_hint, reset_enforcer_flags, validate_agent_dispatch
 """
 
 import json
+import os
 import re
 import sys
 from datetime import datetime, timedelta
@@ -93,6 +99,105 @@ WINDOWS_BLOCKED_CMDS = [
     "format ", "label ", "mode ", "more ", "net ", "path ", "print ",
     "recover ", "replace ", "sort ", "subst ", "tree ", "vol ",
 ]
+
+# ---------------------------------------------------------------------------
+# TOOL 9 support: agent-persona dispatch validation constants.
+#
+# SIBLING IMPLEMENTATION NOTICE: this block, and _resolve_agents_registry /
+# _find_agent_record / _extract_agent_name / _extract_declared_skills /
+# _skill_read_path_present / validate_agent_dispatch below, are a faithful
+# port of claude-workflow-engine/hooks/pre_tool_enforcer/policies/agent_persona.py's
+# check_agent_persona(). That file is the sibling implementation -- if you
+# change the semantics here, check whether it needs the same change there
+# (and vice versa), or the two copies will silently diverge.
+# ---------------------------------------------------------------------------
+
+_GENERIC_TYPES = ("general-purpose", "claude", "")
+_PERSONA_MARKER = "---persona---"
+_ESCAPE_HATCH = "[GENERIC-OK]"
+
+# Auto-exempt pattern: dispatches whose prompt targets writing a brand-new
+# skills/{name}/SKILL.md or agents/{name}/agent.md file. There is never a
+# persona to inject for these -- the file being authored IS the persona/skill,
+# and it does not exist yet.
+_SKILL_OR_AGENT_AUTHOR_PATTERN = re.compile(
+    r"skills[/\\][a-z0-9][a-z0-9\-]*[/\\]SKILL\.md|agents[/\\][a-z0-9][a-z0-9\-]*[/\\]agent\.md",
+    re.IGNORECASE,
+)
+
+# Persona block body: everything between '---persona---' and the next line
+# that is just dashes (the template's closing '---').
+_PERSONA_BLOCK_RE = re.compile(r"---persona---(.*?)^-{3,}\s*$", re.DOTALL | re.MULTILINE)
+
+# 'skills:' field value, captured up to the next top-level 'key:' line (or
+# end of block). Works for both inline ('skills: [a, b]') and YAML-list forms.
+_SKILLS_FIELD_RE = re.compile(r"skills\s*:\s*(.*?)(?:\n[ \t]*[A-Za-z_][\w-]*\s*:|\Z)", re.DOTALL | re.IGNORECASE)
+
+# A skill slug: lowercase, hyphen-separated words with zero or more hyphens.
+# The quantifier must be zero-or-more ('*'), not one-or-more ('+'), or
+# hyphen-less skill names (e.g. 'docker', 'kubernetes') are silently dropped.
+_SKILL_TOKEN_RE = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*")
+
+# 'agent: <name>' line inside the persona block.
+_AGENT_NAME_RE = re.compile(r"^\s*agent\s*:\s*([a-z0-9][a-z0-9\-]*)\s*$", re.IGNORECASE | re.MULTILINE)
+
+# The mandated 'WORKING DIRECTORY & LIBRARY PATH: <path>. ...' line every
+# dispatch prompt is supposed to start with.
+_LIBRARY_PATH_LINE_RE = re.compile(r"WORKING DIRECTORY\s*&\s*LIBRARY PATH\s*:\s*([^\n]+?)(?:\.\s|\n|$)", re.IGNORECASE)
+
+_BLOCK_MSG_NO_PERSONA = (
+    "[PRE-TOOL BLOCKED] Generic subagent spawned without a library persona!\n"
+    "  Tool       : Agent/Task spawn with subagent_type=general-purpose (or unset)\n"
+    "  Problem    : No agents/{name}/agent.md persona was injected into the prompt.\n"
+    "  Required   : Route to a library agent, read its Skill Dependencies, then\n"
+    "               inject its persona as a '---persona---' YAML block at the top\n"
+    "               of the prompt (see ORCHESTRATION_TEMPLATE.md STEP 0.05,\n"
+    "               Subagent Dispatch Contract).\n"
+    "  Escape hatch: prefix the prompt/description with [GENERIC-OK] for a\n"
+    "               genuinely generic one-off task with no matching persona,\n"
+    "               OR a recurring task with no persona to inject because the\n"
+    "               persona/skill IS what the task produces (e.g. authoring a\n"
+    "               new SKILL.md / agent.md for a library that doesn't have\n"
+    "               that persona yet).\n"
+    "  Note       : Local code exploration should use the built-in 'Explore'\n"
+    "               subagent_type instead -- it is not gated by this policy.\n"
+    "  Action     : Add subagent_type of a named library agent, or inject the\n"
+    "               '---persona---' block, or prefix with [GENERIC-OK]."
+)
+
+_BLOCK_MSG_HOLLOW_PERSONA = (
+    "[PRE-TOOL BLOCKED] Persona injected but its skills were not actually carried!\n"
+    "  Tool       : Agent/Task spawn with subagent_type=general-purpose (or unset)\n"
+    "  Problem    : {detail}\n"
+    "  Required   : Per ORCHESTRATION_TEMPLATE.md STEP 0.05, the persona block's\n"
+    "               'skills:' field must list the agent's full skill set (mandatory\n"
+    "               AGENT_USES_SKILL edges + OPTIONAL_SKILL edges), and the prompt\n"
+    "               body must instruct the subagent to READ each one at its real\n"
+    "               'skills/<name>/SKILL.md' path before doing anything else. A\n"
+    "               persona name alone is a hollow dispatch -- the subagent never\n"
+    "               receives the skill knowledge it is supposed to apply.\n"
+    "  Escape hatch: prefix the prompt/description with [GENERIC-OK] only if this\n"
+    "               agent genuinely has zero skill dependencies (rare -- check its\n"
+    "               agent.md Skill Dependencies section first)."
+)
+
+_BLOCK_MSG_INCOMPLETE_SKILLS = (
+    "[PRE-TOOL BLOCKED] Persona's declared skills do not match its real mandatory set!\n"
+    "  Tool       : Agent/Task spawn with subagent_type=general-purpose (or unset)\n"
+    "  Agent      : {agent_name}\n"
+    "  Problem    : knowledge-graph/_master/agents_all.json lists this agent's mandatory\n"
+    "               skills as: {mandatory}\n"
+    "               but the persona block's 'skills:' field is missing: {missing}\n"
+    "  Required   : The 'skills:' field must include EVERY mandatory skill for this\n"
+    "               agent (plus any task-relevant optional ones) -- a self-consistent\n"
+    "               but incomplete or wrong skill list is still a hollow dispatch, just\n"
+    "               one that passes a naive format check. Copy the mandatory list above\n"
+    "               into 'skills:' and add a matching 'skills/<name>/SKILL.md' read\n"
+    "               instruction for each.\n"
+    "  Escape hatch: prefix the prompt/description with [GENERIC-OK] only if this is a\n"
+    "               deliberate, reduced-scope dispatch that genuinely does not need the\n"
+    "               full mandatory set for this specific subtask."
+)
 
 
 def _get_session_id() -> str:
@@ -741,6 +846,235 @@ def reset_enforcer_flags(
         })
     except Exception as e:
         return to_json({"success": False, "error": str(e)})
+
+
+# =============================================================================
+# TOOL 9: AGENT PERSONA DISPATCH VALIDATION
+# =============================================================================
+#
+# Port of check_agent_persona() -- see the SIBLING IMPLEMENTATION NOTICE above
+# the TOOL 9 support constants for the anti-drift pointer to the original.
+
+
+def _resolve_agents_registry(prompt: str, library_path: str = "") -> Optional[list]:
+    """Best-effort locate and parse knowledge-graph/_master/agents_all.json.
+
+    Tries, in order: the explicit `library_path` override parameter, the
+    GLOBAL_LIBRARY_PATH environment variable, then the 'WORKING DIRECTORY &
+    LIBRARY PATH: <path>' line ORCHESTRATION_TEMPLATE.md mandates at the top
+    of every dispatch prompt. Returns the parsed list of agent records, or
+    None if no candidate path resolves to a readable, parseable registry.
+
+    This tool is called from every project, not just projects that use
+    claude-global-library -- callers MUST treat None as fail-open (skip the
+    ground-truth check entirely), never as a reason to block. A project that
+    does not use this library, or whose library copy is unreachable for some
+    incidental reason, must not have its dispatches blocked by an
+    infrastructure lookup failure.
+
+    Args:
+        prompt: The dispatch prompt text to search for a library path line.
+        library_path: Optional explicit override, highest priority. Exists
+            because this server is a single long-lived stdio process per
+            session -- an env var resolved once at process start could go
+            stale or be absent for the session, unlike the original hook
+            which re-resolved the environment on every process spawn.
+
+    Returns:
+        Parsed list of agent records, or None if unresolvable.
+    """
+    candidates = []
+    if library_path:
+        candidates.append(library_path)
+    env_path = os.environ.get("GLOBAL_LIBRARY_PATH")
+    if env_path:
+        candidates.append(env_path)
+    path_match = _LIBRARY_PATH_LINE_RE.search(prompt)
+    if path_match:
+        candidates.append(path_match.group(1).strip().strip('"').strip("'"))
+
+    for base in candidates:
+        try:
+            registry_path = os.path.join(base, "knowledge-graph", "_master", "agents_all.json")
+            if not os.path.isfile(registry_path):
+                continue
+            with open(registry_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        agents = data.get("agents") if isinstance(data, dict) else data
+        if isinstance(agents, list) and agents:
+            return agents
+    return None
+
+
+def _find_agent_record(agents: list, name: str) -> Optional[dict]:
+    """Return the agent record whose 'name' field matches (case-insensitive),
+    or None if not found. `agents` is the list _resolve_agents_registry returns.
+    """
+    lowered = name.strip().lower()
+    for record in agents:
+        if isinstance(record, dict) and str(record.get("name", "")).strip().lower() == lowered:
+            return record
+    return None
+
+
+def _extract_agent_name(persona_block_text: str) -> Optional[str]:
+    """Return the 'agent: <name>' value from a persona block, or None."""
+    match = _AGENT_NAME_RE.search(persona_block_text)
+    return match.group(1).strip().lower() if match else None
+
+
+def _extract_declared_skills(persona_block_text: str) -> list:
+    """Return the deduped, lowercased skill slugs listed in a persona block's
+    'skills:' field. Empty list if the field is missing, empty, or unparseable.
+    """
+    field_match = _SKILLS_FIELD_RE.search(persona_block_text)
+    if not field_match:
+        return []
+    tokens = _SKILL_TOKEN_RE.findall(field_match.group(1))
+    declared = []
+    for token in tokens:
+        lowered = token.lower()
+        if lowered not in declared:
+            declared.append(lowered)
+    return declared
+
+
+def _skill_read_path_present(prompt: str, skill: str) -> bool:
+    """True if the prompt instructs reading skill's real SKILL.md path."""
+    pattern = re.compile(r"skills[/\\]" + re.escape(skill) + r"[/\\]SKILL\.md", re.IGNORECASE)
+    return bool(pattern.search(prompt))
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False,
+    idempotentHint=True, openWorldHint=False))
+@mcp_tool_handler
+def validate_agent_dispatch(
+    subagent_type: Annotated[str, Field(
+        description="The subagent_type parameter of the proposed Agent/Task "
+                    "dispatch, e.g. 'general-purpose', 'Explore', or empty.")] = "",
+    prompt: Annotated[str, Field(
+        description="Full prompt (or description) text of the proposed "
+                    "dispatch, including any '---persona---' block.")] = "",
+    library_path: Annotated[str, Field(
+        description="Optional override for GLOBAL_LIBRARY_PATH -- the "
+                    "absolute path to claude-global-library used to resolve "
+                    "knowledge-graph/_master/agents_all.json for the "
+                    "ground-truth mandatory-skill check. Falls back to the "
+                    "GLOBAL_LIBRARY_PATH environment variable, then to a "
+                    "'WORKING DIRECTORY & LIBRARY PATH:' line inside prompt.")] = "",
+) -> str:
+    """Validate a proposed general-purpose subagent dispatch for a real,
+    skill-carrying library persona, mirroring claude-workflow-engine's
+    (now unreachable, per ADR-006) PreToolUse check_agent_persona() policy.
+
+    This tool is explicitly invoked by the orchestrating session before a
+    general-purpose Agent/Task dispatch -- no live hook calls it. Per
+    ORCHESTRATION_TEMPLATE.md STEP 0.05's Subagent Dispatch Contract, call
+    this before issuing an Agent/Task spawn with subagent_type unset,
+    'general-purpose', or 'claude'; if `allowed` is false, fix the prompt per
+    `blocks`/`detail` and re-check before dispatching.
+
+    Three failure modes are gated (fail-closed unless an escape hatch or an
+    auto-exemption applies):
+      1. No '---persona---' block at all.
+      2. A '---persona---' block present but hollow -- no 'skills:' field, an
+         empty one, or declared skills with no matching
+         'skills/<name>/SKILL.md' read instruction in the prompt body.
+      3. A '---persona---' block that is internally self-consistent but still
+         wrong -- it names a real library agent yet omits one or more of that
+         agent's actual mandatory skills per
+         knowledge-graph/_master/agents_all.json. This check is fail-open: if
+         the registry cannot be located, or the named agent is not found in
+         it, the dispatch is allowed through on checks 1-2 alone.
+
+    Named built-in subagent types (e.g. Explore, Plan) are never gated. An
+    explicit '[GENERIC-OK]' marker in the prompt/description is an escape
+    hatch. Dispatches that target writing a new skills/{name}/SKILL.md or
+    agents/{name}/agent.md file are auto-exempt (no marker needed) when no
+    persona block is present at all.
+
+    Args:
+        subagent_type: The proposed dispatch's subagent_type.
+        prompt: The proposed dispatch's prompt (or description) text.
+        library_path: Optional GLOBAL_LIBRARY_PATH override.
+
+    Returns:
+        JSON string: {"allowed": bool, "reason": str, "blocks": [...],
+        "detail": str}.
+    """
+    blocked = False
+    message = ""
+
+    if subagent_type.strip().lower() not in _GENERIC_TYPES:
+        blocked, message = False, ""
+    elif _ESCAPE_HATCH in prompt:
+        blocked, message = False, ""
+    elif _PERSONA_MARKER not in prompt:
+        # The skill/agent-authoring exemption only applies to prompts with no
+        # persona block: its premise is "the target agent.md/SKILL.md doesn't
+        # exist yet, so there is nothing to inject". Once a '---persona---'
+        # block is present, that premise no longer holds.
+        if _SKILL_OR_AGENT_AUTHOR_PATTERN.search(prompt):
+            blocked, message = False, ""
+        else:
+            blocked, message = True, _BLOCK_MSG_NO_PERSONA
+    else:
+        block_match = _PERSONA_BLOCK_RE.search(prompt)
+        if not block_match:
+            blocked, message = True, _BLOCK_MSG_HOLLOW_PERSONA.format(
+                detail="'---persona---' marker found but the block never closes with "
+                "a matching '---' line, so no skills: field could be parsed."
+            )
+        else:
+            declared_skills = _extract_declared_skills(block_match.group(1))
+            if not declared_skills:
+                blocked, message = True, _BLOCK_MSG_HOLLOW_PERSONA.format(
+                    detail="the persona block has no 'skills:' field (or it is empty) -- "
+                    "no skill knowledge is being injected into the subagent."
+                )
+            else:
+                missing = [s for s in declared_skills if not _skill_read_path_present(prompt, s)]
+                if missing:
+                    blocked, message = True, _BLOCK_MSG_HOLLOW_PERSONA.format(
+                        detail="skills declared in the persona block have no matching "
+                        "'skills/<name>/SKILL.md' read instruction in the prompt: " + ", ".join(missing)
+                    )
+                else:
+                    agents = _resolve_agents_registry(prompt, library_path)
+                    if agents is not None:
+                        agent_name = _extract_agent_name(block_match.group(1))
+                        if agent_name is not None:
+                            record = _find_agent_record(agents, agent_name)
+                            if record is not None:
+                                # In-domain mandatory skills live in "mandatory_skills"; a skill
+                                # whose SKILL.md sits in a different domain's KG is instead
+                                # recorded under "cross_domain_mandatory_skills" -- both are
+                                # equally mandatory.
+                                in_domain = record.get("mandatory_skills")
+                                cross_domain = record.get("cross_domain_mandatory_skills")
+                                mandatory = list(in_domain or [])
+                                for skill in cross_domain or []:
+                                    if skill not in mandatory:
+                                        mandatory.append(skill)
+                                if isinstance(mandatory, list) and mandatory:
+                                    declared_set = set(declared_skills)
+                                    missing_mandatory = [s for s in mandatory if s.lower() not in declared_set]
+                                    if missing_mandatory:
+                                        blocked, message = True, _BLOCK_MSG_INCOMPLETE_SKILLS.format(
+                                            agent_name=agent_name,
+                                            mandatory=", ".join(mandatory),
+                                            missing=", ".join(missing_mandatory),
+                                        )
+
+    return to_json({
+        "allowed": not blocked,
+        "reason": message.splitlines()[0] if message else "All checks passed",
+        "blocks": [message] if message else [],
+        "detail": message,
+    })
 
 
 if __name__ == "__main__":

@@ -5,7 +5,9 @@
 
 # mcp-pre-tool-gate
 
-A FastMCP server that acts as a pre-execution policy enforcement gate for Claude Code tool calls. Before any file-modification tool (Write, Edit, NotebookEdit) executes, `mcp-pre-tool-gate` runs 8 sequential policy checks — verifying checkpoint state, task breakdown, skill selection, Level 1 sync completion, Level 2 standards completion, and platform safety rules — and returns an allow or block decision with actionable error messages. It also injects dynamic skill context hints based on file extension and matches tool call patterns against a known failure knowledge base to prevent common mistakes before they cascade. This server is one of 13 MCP servers in the [Claude Workflow Engine](https://github.com/techdeveloper-org/claude-workflow-engine) ecosystem and is invoked automatically by the Claude Code `PreToolUse` hook.
+A FastMCP server that acts as a pre-execution policy enforcement gate for Claude Code tool calls. Before any file-modification tool (Write, Edit, NotebookEdit) executes, `mcp-pre-tool-gate` runs 8 sequential policy checks — verifying checkpoint state, task breakdown, skill selection, Level 1 sync completion, Level 2 standards completion, and platform safety rules — and returns an allow or block decision with actionable error messages. It also injects dynamic skill context hints based on file extension, matches tool call patterns against a known failure knowledge base to prevent common mistakes before they cascade, and validates that a general-purpose subagent dispatch carries a real, skill-carrying library persona. This server is one of 13 MCP servers in the [Claude Workflow Engine](https://github.com/techdeveloper-org/claude-workflow-engine) ecosystem.
+
+**No live hook triggers any of these tools.** `claude-workflow-engine`'s [ADR-006](https://github.com/techdeveloper-org/claude-workflow-engine/blob/main/docs/architecture/ADR-006-hook-free-execution.md) (Hook-Free Execution Model, executed 2026-08-04) removed the `PreToolUse`/`PostToolUse`/`UserPromptSubmit` hook registrations from `~/.claude/settings.json` to eliminate their per-tool-call latency. Every tool in this server — including `validate_tool_call` and `validate_agent_dispatch` — is explicitly invoked by the orchestrating Claude Code session as a deliberate, on-demand self-check, not triggered automatically by any live hook. Enforcement is opt-in: a session that never calls these tools gets no policy checks. See the "How It Works" section below for what an explicit call looks like in practice.
 
 ---
 
@@ -17,7 +19,7 @@ A FastMCP server that acts as a pre-execution policy enforcement gate for Claude
 - [Tool Reference](#tool-reference)
 - [Installation](#installation)
 - [Configuration](#configuration)
-- [PreToolUse Hook Integration](#pretooluse-hook-integration)
+- [Invocation Model](#invocation-model)
 - [Usage Examples](#usage-examples)
 - [Project Structure](#project-structure)
 - [Part of Claude Workflow Engine](#part-of-claude-workflow-engine)
@@ -36,6 +38,7 @@ A FastMCP server that acts as a pre-execution policy enforcement gate for Claude
 - **Windows platform safety** — blocks Windows-only shell commands in Bash (del, copy, xcopy, dir, move, etc.) and blocks non-ASCII content in `.py` files (cp1252 safety)
 - **Session-scoped flag system** — enforcement flags are scoped to the active session ID and auto-expire via configurable TTL (default 90 seconds) and age limits (default 60 minutes)
 - **Flow-trace awareness** — reads `flow-trace.json` to verify Level 1 sync and Level 2 standards pipeline steps completed; fails open if no trace is found
+- **Agent-persona dispatch validation** — `validate_agent_dispatch` checks a proposed general-purpose `Agent`/`Task` dispatch for a real `---persona---` block, that its declared `skills:` are actually carried (matching `skills/<name>/SKILL.md` read instructions in the prompt body), and — when a `claude-global-library` `knowledge-graph/_master/agents_all.json` registry can be resolved — that the declared skill set matches the named agent's real mandatory set. Fail-open by design when the registry can't be found; escape hatches (`[GENERIC-OK]`, skill/agent-authoring auto-exemption) preserved from the original hook-era policy
 - **Zero-configuration startup** — paths resolved automatically via `path_resolver.py`; no required environment variables for basic operation
 - **FastMCP stdio transport** — standard MCP JSON-RPC over stdio; works with any MCP-compatible client
 
@@ -43,11 +46,11 @@ A FastMCP server that acts as a pre-execution policy enforcement gate for Claude
 
 ## How It Works
 
+There is no live hook wired into this server's path — every tool call below is something the orchestrating Claude Code session decides to make explicitly, as a self-check, before or after it takes some other action. See [Invocation Model](#invocation-model) for why.
+
 ```
-Claude Code calls a tool (e.g., Write, Edit, Bash)
-         |
-         v
-PreToolUse hook fires -> invokes mcp-pre-tool-gate
+Orchestrating session is about to call a tool (e.g., Write, Edit, Bash)
+and explicitly chooses to self-check first by calling mcp-pre-tool-gate
          |
          v
 validate_tool_call(tool_name, tool_input)
@@ -67,11 +70,44 @@ validate_tool_call(tool_name, tool_input)
                   YES --> run check 8 (Python Unicode blocking)
          |
          v
-    allowed: true  -->  Claude Code proceeds with tool execution
-    allowed: false -->  Claude Code shows block reason; tool does NOT execute
+    allowed: true  -->  session proceeds with the tool call it was about to make
+    allowed: false -->  session sees the block reason and adjusts before proceeding
 ```
 
 Optimization hints (Grep head_limit, Read offset/limit for large files) are appended as non-blocking `hints` regardless of the allow/block decision.
+
+A second, independent self-check follows the same explicit-call model for agent dispatches:
+
+```
+Orchestrating session is about to spawn a general-purpose Agent/Task subagent
+and explicitly chooses to self-check first by calling mcp-pre-tool-gate
+         |
+         v
+validate_agent_dispatch(subagent_type, prompt, library_path)
+         |
+         +-- subagent_type is a named built-in (e.g. Explore, Plan)?
+         |        YES --> allowed: true, no persona required
+         |
+         +-- prompt contains [GENERIC-OK], or targets authoring a new
+         |   skills/{name}/SKILL.md or agents/{name}/agent.md?
+         |        YES --> allowed: true (escape hatch / auto-exemption)
+         |
+         +-- '---persona---' block present, well-formed, 'skills:' non-empty,
+         |   every declared skill has a matching 'skills/<name>/SKILL.md'
+         |   read instruction in the prompt body?
+         |        NO  --> allowed: false, blocks explain what is missing
+         |
+         +-- agents_all.json registry resolvable (library_path param ->
+             GLOBAL_LIBRARY_PATH env var -> 'WORKING DIRECTORY & LIBRARY
+             PATH:' line in the prompt) and the named agent found in it?
+                  YES --> declared skills must cover every real mandatory +
+                          cross-domain-mandatory skill, or allowed: false
+                  NO  --> fail-open, allowed: true on the checks above alone
+         |
+         v
+    allowed: true  -->  session proceeds with the dispatch
+    allowed: false -->  session fixes the prompt per `blocks`/`detail` and re-checks
+```
 
 ---
 
@@ -108,6 +144,7 @@ All checks run in order. The first failing check short-circuits the remainder (e
 | `check_failure_patterns` | Match a tool call against known failure patterns (from `failure-kb.json`) and return non-blocking hints | `tool_name` (str, required), `tool_input` (JSON string, default `{}`) |
 | `get_dynamic_skill_hint` | Return the suggested skill/agent name based on a file's extension | `file_path` (str, required) |
 | `reset_enforcer_flags` | Delete enforcement flag files for the current session | `flag_name` (str: `"task-breakdown-pending"` \| `"skill-selection-pending"` \| `"checkpoint-pending"` \| `"all"`, default `"all"`) |
+| `validate_agent_dispatch` | Validate a proposed general-purpose `Agent`/`Task` dispatch for a real, skill-carrying library persona; returns `{"allowed", "reason", "blocks", "detail"}` | `subagent_type` (str, default `""`), `prompt` (str, default `""`), `library_path` (str, optional `GLOBAL_LIBRARY_PATH` override, default `""`) |
 
 ### File Extension to Skill Mapping
 
@@ -199,9 +236,9 @@ The server reads the last entry in this file (if it is a list) or the entire doc
 
 ---
 
-## PreToolUse Hook Integration
+## Invocation Model
 
-The recommended way to use `mcp-pre-tool-gate` is as a Claude Code MCP server triggered by the `PreToolUse` hook. Add the following to `~/.claude/settings.json`:
+`mcp-pre-tool-gate` registers as an MCP server (`~/.claude/settings.json` `mcpServers`) but is **not** wired to any Claude Code hook event. Register it like any other MCP server:
 
 ```json
 {
@@ -211,46 +248,30 @@ The recommended way to use `mcp-pre-tool-gate` is as a Claude Code MCP server tr
       "args": ["/absolute/path/to/mcp-pre-tool-gate/server.py"],
       "env": {}
     }
-  },
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python /absolute/path/to/hooks/pre-tool-enforcer.py"
-          }
-        ]
-      }
-    ]
   }
 }
 ```
 
-**Hook flow:**
+**Why no hook.** `claude-workflow-engine` previously ran this same policy logic as a synchronous `PreToolUse` hook — a Python process spawn on every single tool call, `matcher: ""`, 60s timeout, `async: false` (per the user's global instruction that all hooks must be synchronous). Combined with a `PostToolUse` hook on the same pattern, that was up to 120s of blocking latency before Claude ever saw a prompt, and a hook crash blocked the tool call outright. [ADR-006](https://github.com/techdeveloper-org/claude-workflow-engine/blob/main/docs/architecture/ADR-006-hook-free-execution.md) (Hook-Free Execution Model) removed the `PreToolUse`/`PostToolUse`/`UserPromptSubmit` registrations entirely (executed 2026-08-04) to eliminate that latency, and named "re-implement the check as an explicitly-invoked MCP tool" as the precedent pattern for restoring a check's *logic* without restoring the *hook*.
+
+**What that means in practice:** every tool in this server — `validate_tool_call`, `validate_agent_dispatch`, and the rest — is a deterministic, pipe-testable self-check the orchestrating session chooses to call, not something that fires on its own. There is no live mechanism forcing that call to happen before a given `Write`/`Edit`/`Agent`/`Task` call; a session can simply not call it. What this server upgrades is "trust the policy was followed" to "a concrete tool call exists that will catch a violation if you make it" — it is a callable self-check, not a hard gate, and enforcement stays opt-in (the consequence ADR-006 states explicitly: "enforcement becomes opt-in. Policies do not apply on sessions where the plugin is never invoked").
+
+**Example flow (agent dispatch):**
 
 ```
-User prompt submitted
+Orchestrating session, following ORCHESTRATION_TEMPLATE.md STEP 0.05's
+Subagent Dispatch Contract, is about to call Agent/Task with
+subagent_type="general-purpose"
        |
        v
-Claude Code decides to call a tool (e.g., Write a file)
+Session explicitly calls mcp__pre-tool-gate__validate_agent_dispatch(
+    subagent_type, prompt)
        |
-       v
-PreToolUse hook fires
+       +-- allowed: true  -> session proceeds with the Agent/Task call
        |
-       v
-pre-tool-enforcer.py (hook shim)
-  -> calls mcp_tool: pre-tool-gate / validate_tool_call
-       |
-       +-- allowed: true  -> Claude Code proceeds, tool executes normally
-       |
-       +-- allowed: false -> Claude Code receives block decision
-                             Tool does NOT execute
-                             Reason shown in terminal
+       +-- allowed: false -> session fixes the prompt per `blocks`/`detail`,
+                             then re-checks before dispatching
 ```
-
-The hook operates synchronously (`async: false`). Claude Code waits for the hook result before proceeding.
 
 ---
 
@@ -371,7 +392,28 @@ The hook operates synchronously (`async: false`). Claude Code waits for the hook
 }
 ```
 
-### Example 6: Full enforcer state snapshot
+### Example 6: Agent dispatch blocked — no persona injected
+
+```json
+// Request
+{
+  "tool": "validate_agent_dispatch",
+  "arguments": {
+    "subagent_type": "general-purpose",
+    "prompt": "go research competitor pricing"
+  }
+}
+
+// Response
+{
+  "allowed": false,
+  "reason": "[PRE-TOOL BLOCKED] Generic subagent spawned without a library persona!",
+  "blocks": ["[PRE-TOOL BLOCKED] Generic subagent spawned without a library persona!\n  Tool       : Agent/Task spawn with subagent_type=general-purpose (or unset)\n  ..."],
+  "detail": "[PRE-TOOL BLOCKED] Generic subagent spawned without a library persona!\n  ..."
+}
+```
+
+### Example 7: Full enforcer state snapshot
 
 ```json
 // Request
@@ -406,11 +448,15 @@ The hook operates synchronously (`async: false`). Claude Code waits for the hook
 
 ```
 mcp-pre-tool-gate/
-├── server.py               # FastMCP server — 8 tools, 8 policy checks
+├── server.py               # FastMCP server — 9 tools, 8 policy checks + agent-persona dispatch validation
 ├── input_validator.py      # Input sanitization (null-byte strip, length limits)
 ├── rate_limiter.py         # Token bucket rate limiter (optional enforcement)
 ├── mcp_errors.py           # MCP-specific error types
 ├── requirements.txt        # Runtime dependencies (mcp, fastmcp)
+├── requirements-dev.txt    # Dev/test dependencies (pytest), on top of requirements.txt
+├── tests/                  # pytest suite
+│   ├── conftest.py         # sys.path setup so tests can `import server`
+│   └── test_agent_persona_gate.py  # validate_agent_dispatch coverage
 ├── base/                   # Copy of mcp-base shared library
 │   ├── response.py         # MCPResponse builder + to_json helper
 │   ├── decorators.py       # @mcp_tool_handler decorator
@@ -452,11 +498,11 @@ Shared base library: [mcp-base](https://github.com/techdeveloper-org/mcp-base)
 Contributions are welcome. Please follow these guidelines:
 
 1. Fork the repository and create a feature branch from `main`.
-2. Keep `server.py` focused on the 8 policy checks and 8 tools — do not add unrelated functionality.
+2. Keep `server.py` focused on the policy checks and tools it already owns — do not add unrelated functionality.
 3. If you add a new policy check, add it as check #N in the `validate_tool_call` docstring and update the check counter in the return value.
 4. All new tools must use the `@mcp_tool_handler` decorator from `base/decorators.py`.
-5. Do not add runtime dependencies beyond `mcp` and `fastmcp` without discussion.
-6. Test your changes with a live Claude Code session using the PreToolUse hook configuration shown above.
+5. Do not add runtime dependencies beyond `mcp` and `fastmcp` without discussion (test-only dependencies like `pytest` belong in `requirements-dev.txt`, not `requirements.txt`).
+6. Run `pytest tests/` and test your changes by calling the relevant tool explicitly from a live Claude Code session (see [Invocation Model](#invocation-model) — there is no hook to configure).
 7. Submit a pull request with a clear description of the change and the problem it solves.
 
 ---

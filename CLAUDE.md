@@ -32,6 +32,9 @@ Run via `python server.py` — communicates over stdio using the MCP protocol.
 - `check_failure_patterns` — Match against known failure patterns to provide hints
 - `get_dynamic_skill_hint` — Return dynamic skill recommendation for current context
 - `reset_enforcer_flags` — Reset all enforcement flags for a new task cycle
+- `validate_agent_dispatch` — Validate a proposed general-purpose Agent/Task dispatch for a real, skill-carrying library persona (port of claude-workflow-engine's hook-unreachable `check_agent_persona()`, ADR-006)
+
+**No live hook calls any of the above.** Per ADR-006 (Hook-Free Execution Model), every tool here is explicitly invoked by the orchestrating session, never triggered automatically.
 
 ---
 
