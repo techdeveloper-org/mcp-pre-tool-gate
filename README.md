@@ -1,13 +1,13 @@
 ![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![License MIT](https://img.shields.io/badge/License-MIT-green)
-![Part of claude-workflow-engine](https://img.shields.io/badge/Part%20of-claude--workflow--engine-orange)
+![Part of ai-native-sdlc-engine](https://img.shields.io/badge/Part%20of-claude--workflow--engine-orange)
 ![MCP](https://img.shields.io/badge/Protocol-MCP%20stdio-lightgrey)
 
 # mcp-pre-tool-gate
 
-A FastMCP server that acts as a pre-execution policy enforcement gate for Claude Code tool calls. Before any file-modification tool (Write, Edit, NotebookEdit) executes, `mcp-pre-tool-gate` runs 8 sequential policy checks — verifying checkpoint state, task breakdown, skill selection, Level 1 sync completion, Level 2 standards completion, and platform safety rules — and returns an allow or block decision with actionable error messages. It also injects dynamic skill context hints based on file extension, matches tool call patterns against a known failure knowledge base to prevent common mistakes before they cascade, and validates that a general-purpose subagent dispatch carries a real, skill-carrying library persona. This server is one of 13 MCP servers in the [Claude Workflow Engine](https://github.com/techdeveloper-org/claude-workflow-engine) ecosystem.
+A FastMCP server that acts as a pre-execution policy enforcement gate for Claude Code tool calls. Before any file-modification tool (Write, Edit, NotebookEdit) executes, `mcp-pre-tool-gate` runs 8 sequential policy checks — verifying checkpoint state, task breakdown, skill selection, Level 1 sync completion, Level 2 standards completion, and platform safety rules — and returns an allow or block decision with actionable error messages. It also injects dynamic skill context hints based on file extension, matches tool call patterns against a known failure knowledge base to prevent common mistakes before they cascade, and validates that a general-purpose subagent dispatch carries a real, skill-carrying library persona. This server is one of 13 MCP servers in the [Claude Workflow Engine](https://github.com/techdeveloper-org/ai-native-sdlc-engine) ecosystem.
 
-**No live hook triggers any of these tools.** `claude-workflow-engine`'s [ADR-006](https://github.com/techdeveloper-org/claude-workflow-engine/blob/main/docs/architecture/ADR-006-hook-free-execution.md) (Hook-Free Execution Model, executed 2026-08-04) removed the `PreToolUse`/`PostToolUse`/`UserPromptSubmit` hook registrations from `~/.claude/settings.json` to eliminate their per-tool-call latency. Every tool in this server — including `validate_tool_call` and `validate_agent_dispatch` — is explicitly invoked by the orchestrating Claude Code session as a deliberate, on-demand self-check, not triggered automatically by any live hook. Enforcement is opt-in: a session that never calls these tools gets no policy checks. See the "How It Works" section below for what an explicit call looks like in practice.
+**No live hook triggers any of these tools.** `ai-native-sdlc-engine`'s [ADR-006](https://github.com/techdeveloper-org/ai-native-sdlc-engine/blob/main/docs/architecture/ADR-006-hook-free-execution.md) (Hook-Free Execution Model, executed 2026-08-04) removed the `PreToolUse`/`PostToolUse`/`UserPromptSubmit` hook registrations from `~/.claude/settings.json` to eliminate their per-tool-call latency. Every tool in this server — including `validate_tool_call` and `validate_agent_dispatch` — is explicitly invoked by the orchestrating Claude Code session as a deliberate, on-demand self-check, not triggered automatically by any live hook. Enforcement is opt-in: a session that never calls these tools gets no policy checks. See the "How It Works" section below for what an explicit call looks like in practice.
 
 ---
 
@@ -22,7 +22,7 @@ A FastMCP server that acts as a pre-execution policy enforcement gate for Claude
 - [Invocation Model](#invocation-model)
 - [Usage Examples](#usage-examples)
 - [Project Structure](#project-structure)
-- [Part of Claude Workflow Engine](#part-of-claude-workflow-engine)
+- [Part of Claude Workflow Engine](#part-of-ai-native-sdlc-engine)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -252,7 +252,7 @@ The server reads the last entry in this file (if it is a list) or the entire doc
 }
 ```
 
-**Why no hook.** `claude-workflow-engine` previously ran this same policy logic as a synchronous `PreToolUse` hook — a Python process spawn on every single tool call, `matcher: ""`, 60s timeout, `async: false` (per the user's global instruction that all hooks must be synchronous). Combined with a `PostToolUse` hook on the same pattern, that was up to 120s of blocking latency before Claude ever saw a prompt, and a hook crash blocked the tool call outright. [ADR-006](https://github.com/techdeveloper-org/claude-workflow-engine/blob/main/docs/architecture/ADR-006-hook-free-execution.md) (Hook-Free Execution Model) removed the `PreToolUse`/`PostToolUse`/`UserPromptSubmit` registrations entirely (executed 2026-08-04) to eliminate that latency, and named "re-implement the check as an explicitly-invoked MCP tool" as the precedent pattern for restoring a check's *logic* without restoring the *hook*.
+**Why no hook.** `ai-native-sdlc-engine` previously ran this same policy logic as a synchronous `PreToolUse` hook — a Python process spawn on every single tool call, `matcher: ""`, 60s timeout, `async: false` (per the user's global instruction that all hooks must be synchronous). Combined with a `PostToolUse` hook on the same pattern, that was up to 120s of blocking latency before Claude ever saw a prompt, and a hook crash blocked the tool call outright. [ADR-006](https://github.com/techdeveloper-org/ai-native-sdlc-engine/blob/main/docs/architecture/ADR-006-hook-free-execution.md) (Hook-Free Execution Model) removed the `PreToolUse`/`PostToolUse`/`UserPromptSubmit` registrations entirely (executed 2026-08-04) to eliminate that latency, and named "re-implement the check as an explicitly-invoked MCP tool" as the precedent pattern for restoring a check's *logic* without restoring the *hook*.
 
 **What that means in practice:** every tool in this server — `validate_tool_call`, `validate_agent_dispatch`, and the rest — is a deterministic, pipe-testable self-check the orchestrating session chooses to call, not something that fires on its own. There is no live mechanism forcing that call to happen before a given `Write`/`Edit`/`Agent`/`Task` call; a session can simply not call it. What this server upgrades is "trust the policy was followed" to "a concrete tool call exists that will catch a violation if you make it" — it is a callable self-check, not a hard gate, and enforcement stays opt-in (the consequence ADR-006 states explicitly: "enforcement becomes opt-in. Policies do not apply on sessions where the plugin is never invoked").
 
@@ -488,7 +488,7 @@ The `base/` directory is a copy of the [`mcp-base`](https://github.com/techdevel
 | 12 | [mcp-jenkins-ci](https://github.com/techdeveloper-org/mcp-jenkins-ci) | Jenkins CI/CD trigger and monitoring |
 | 13 | [mcp-figma](https://github.com/techdeveloper-org/mcp-figma) | Figma design token and component extraction |
 
-Main pipeline: [claude-workflow-engine](https://github.com/techdeveloper-org/claude-workflow-engine)
+Main pipeline: [ai-native-sdlc-engine](https://github.com/techdeveloper-org/ai-native-sdlc-engine)
 Shared base library: [mcp-base](https://github.com/techdeveloper-org/mcp-base)
 
 ---

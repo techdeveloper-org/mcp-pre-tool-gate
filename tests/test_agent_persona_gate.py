@@ -3,7 +3,7 @@ test_agent_persona_gate.py - Unit tests for server.py's validate_agent_dispatch
 MCP tool (TOOL 9).
 
 SIBLING TEST SUITE: this file is a deliberate, scenario-parallel port of
-claude-workflow-engine/tests/test_agent_persona_policy.py, which tests the
+ai-native-sdlc-engine/tests/test_agent_persona_policy.py, which tests the
 original (now hook-unreachable, per ADR-006) check_agent_persona() this tool
 ports. Kept parallel on purpose -- a scenario added to one should be mirrored
 into the other by inspection, per the anti-drift guardrail on

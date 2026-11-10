@@ -18,7 +18,7 @@ Also provides:
 - Failure KB pattern matching (known failure prevention)
 - Tool-specific optimization hints (Grep head_limit, Read offset/limit)
 - Explicitly-invoked agent-persona dispatch validation (see TOOL 9) - this
-  server has no live PreToolUse hook registration (claude-workflow-engine
+  server has no live PreToolUse hook registration (ai-native-sdlc-engine
   ADR-006, Hook-Free Execution Model), so every tool here, including TOOL 9,
   is called on-demand by the orchestrating session, never triggered
   automatically.
@@ -106,7 +106,7 @@ WINDOWS_BLOCKED_CMDS = [
 # SIBLING IMPLEMENTATION NOTICE: this block, and _resolve_agents_registry /
 # _find_agent_record / _extract_agent_name / _extract_declared_skills /
 # _skill_read_path_present / validate_agent_dispatch below, are a faithful
-# port of claude-workflow-engine/hooks/pre_tool_enforcer/policies/agent_persona.py's
+# port of ai-native-sdlc-engine/hooks/pre_tool_enforcer/policies/agent_persona.py's
 # check_agent_persona(). That file is the sibling implementation -- if you
 # change the semantics here, check whether it needs the same change there
 # (and vice versa), or the two copies will silently diverge.
@@ -967,7 +967,7 @@ def validate_agent_dispatch(
                     "'WORKING DIRECTORY & LIBRARY PATH:' line inside prompt.")] = "",
 ) -> str:
     """Validate a proposed general-purpose subagent dispatch for a real,
-    skill-carrying library persona, mirroring claude-workflow-engine's
+    skill-carrying library persona, mirroring ai-native-sdlc-engine's
     (now unreachable, per ADR-006) PreToolUse check_agent_persona() policy.
 
     This tool is explicitly invoked by the orchestrating session before a
